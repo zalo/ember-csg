@@ -56,7 +56,7 @@ ember::InputMesh make_cube(double cx, double cy, double cz, double s)
 void print_result(const char* name, ember::BooleanResult const& result)
 {
     auto polys = ember::extract_output(result);
-    auto soup = ember::triangulate_output(result);
+    auto soup = ember::triangulate_and_resolve(result);
 
     std::printf("\n=== %s ===\n", name);
     std::printf("Output polygons: %zu\n", polys.size());

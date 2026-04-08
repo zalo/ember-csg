@@ -21,6 +21,7 @@
 #include <ember/intersect_polygons.hh>
 #include <ember/local_bsp.hh>
 #include <ember/mesh.hh>
+#include <ember/resolve_tjunctions.hh>
 #include <ember/polygon.hh>
 #include <ember/segment_trace.hh>
 #include <ember/subdivision.hh>
@@ -192,13 +193,6 @@ inline std::vector<OutputPolygon> extract_output(BooleanResult const& result)
     return out;
 }
 
-// Extract output as indexed triangle soup (triangulating convex polygons via fan)
-struct TriangleSoup
-{
-    std::vector<OutputVertex> vertices;
-    std::vector<std::array<int, 3>> triangles;
-};
-
 inline TriangleSoup triangulate_output(BooleanResult const& result)
 {
     TriangleSoup soup;
@@ -227,6 +221,12 @@ inline TriangleSoup triangulate_output(BooleanResult const& result)
     }
 
     return soup;
+}
+
+// Triangulate and resolve T-junctions for manifold output
+inline TriangleSoup triangulate_and_resolve(BooleanResult const& result)
+{
+    return resolve_tjunctions(triangulate_output(result));
 }
 
 // Write output as OBJ format string

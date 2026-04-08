@@ -196,6 +196,13 @@ inline PolygonSoup prepare_input(std::vector<InputMesh> const& meshes)
     return soup;
 }
 
+// Indexed triangle soup (output format)
+struct TriangleSoup
+{
+    std::vector<OutputVertex> vertices;
+    std::vector<std::array<int, 3>> triangles;
+};
+
 struct OutputPolygon
 {
     std::vector<OutputVertex> vertices;

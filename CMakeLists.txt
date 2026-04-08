@@ -52,3 +52,6 @@ target_link_libraries(ember-trace PRIVATE ember-csg)
 
 add_executable(ember-perf test/test_perf.cc)
 target_link_libraries(ember-perf PRIVATE ember-csg)
+
+add_executable(ember-manifold test/test_manifold.cc)
+target_link_libraries(ember-manifold PRIVATE ember-csg)
