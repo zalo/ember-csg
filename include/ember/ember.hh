@@ -99,68 +99,13 @@ inline BooleanResult boolean_operation(
     result.output.transform = soup.transform;
     result.transform = soup.transform;
 
-    // Build AABB boundary planes for validity checking.
-    // Valid BSP leaf vertices must lie within the root AABB because all input
-    // vertices and all clipping planes are within bounds.
-    // Vertices outside indicate degenerate BSP leaves from nearly-parallel planes.
-    plane_t aabb_planes[6];
-    for (int a = 0; a < 3; a++)
-    {
-        // x[a] >= min[a]  →  x[a] - min[a] >= 0  →  classify > 0 means OK
-        aabb_planes[a*2].a = (a == 0) ? normal_scalar_t(1) : normal_scalar_t(0);
-        aabb_planes[a*2].b = (a == 1) ? normal_scalar_t(1) : normal_scalar_t(0);
-        aabb_planes[a*2].c = (a == 2) ? normal_scalar_t(1) : normal_scalar_t(0);
-        aabb_planes[a*2].d = plane_d_t(-int64_t((&soup.bounds.min.x)[a]));
-        // x[a] <= max[a]  →  -x[a] + max[a] >= 0
-        aabb_planes[a*2+1].a = (a == 0) ? normal_scalar_t(-1) : normal_scalar_t(0);
-        aabb_planes[a*2+1].b = (a == 1) ? normal_scalar_t(-1) : normal_scalar_t(0);
-        aabb_planes[a*2+1].c = (a == 2) ? normal_scalar_t(-1) : normal_scalar_t(0);
-        aabb_planes[a*2+1].d = plane_d_t(int64_t((&soup.bounds.max.x)[a]));
-    }
-
-    // Deduplicate: when subdivision sends full polygons to both child cells,
-    // the same polygon_index may be classified and emitted from both.
-    // Keep only the FIRST occurrence of each polygon_index.
-    std::set<int> seen_polygon_indices;
-
-    int filtered = 0;
     for (auto& cp : classified)
     {
         if (cp.classification == -1)
             cp.polygon = cp.polygon.inverted();
-
-        // Dedup: skip if this polygon was already emitted from another cell.
-        // Only dedup NON-BSP polygons (original triangles with 3 edges).
-        // BSP leaves (>3 edges) are unique fragments and should not be deduped.
-        if (cp.polygon.polygon_index >= 0 && cp.polygon.vertex_count() == 3)
-        {
-            if (!seen_polygon_indices.insert(cp.polygon.polygon_index).second)
-            { filtered++; continue; }
-        }
-
-        // Exact validity check: all vertices must be within root AABB
-        bool valid = true;
-        for (int vi = 0; vi < cp.polygon.vertex_count() && valid; vi++)
-        {
-            auto pt = cp.polygon.vertex(vi);
-            if (!pt.is_valid()) { valid = false; break; }
-
-            (void)vi; // vertex check is done by classify below
-
-            for (int p = 0; p < 6; p++)
-            {
-                if (exact_classify(pt, aabb_planes[p]) < 0)
-                { valid = false; break; }
-            }
-        }
-        if (!valid) { filtered++; continue; }
-
         result.output.polygons.push_back(std::move(cp.polygon));
         result.classifications.push_back(cp.classification);
     }
-    if (filtered > 0)
-        std::fprintf(stderr, "[ember] filtered %d/%zu degenerate polygons\n",
-                     filtered, classified.size());
 
     return result;
 }

@@ -29,9 +29,12 @@ endif()
 file(GLOB_RECURSE EMBER_HEADERS "include/*.hh")
 file(GLOB_RECURSE EMBER_SOURCES "src/*.cc")
 
+set(TINYBVH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tinybvh")
+
 add_library(ember-csg STATIC ${EMBER_SOURCES} ${EMBER_HEADERS})
 target_include_directories(ember-csg PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${TINYBVH_DIR}"
     "${MESH_KERNEL_DIR}/src"
 )
 target_link_libraries(ember-csg PUBLIC typed-geometry clean-core)

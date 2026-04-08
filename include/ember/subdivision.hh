@@ -474,9 +474,7 @@ inline void process_leaf(
             }
         }
     }
-    if (pass2_polys > 0)
-        std::fprintf(stderr, "[process_leaf] pass2: %d polys, %d leaves, %d emit, %zu total output\n",
-            pass2_polys, pass2_leaves, pass2_emit, output.size());
+    (void)pass2_polys; (void)pass2_leaves; (void)pass2_emit;
 }
 
 // Main recursive subdivision function
