@@ -29,6 +29,7 @@
 #include <ember/exact_classify.hh>
 #include <ember/winding.hh>
 
+#include <set>
 #include <vector>
 
 namespace ember
@@ -117,11 +118,25 @@ inline BooleanResult boolean_operation(
         aabb_planes[a*2+1].d = plane_d_t(int64_t((&soup.bounds.max.x)[a]));
     }
 
+    // Deduplicate: when subdivision sends full polygons to both child cells,
+    // the same polygon_index may be classified and emitted from both.
+    // Keep only the FIRST occurrence of each polygon_index.
+    std::set<int> seen_polygon_indices;
+
     int filtered = 0;
     for (auto& cp : classified)
     {
         if (cp.classification == -1)
             cp.polygon = cp.polygon.inverted();
+
+        // Dedup: skip if this polygon was already emitted from another cell.
+        // Only dedup NON-BSP polygons (original triangles with 3 edges).
+        // BSP leaves (>3 edges) are unique fragments and should not be deduped.
+        if (cp.polygon.polygon_index >= 0 && cp.polygon.vertex_count() == 3)
+        {
+            if (!seen_polygon_indices.insert(cp.polygon.polygon_index).second)
+            { filtered++; continue; }
+        }
 
         // Exact validity check: all vertices must be within root AABB
         bool valid = true;

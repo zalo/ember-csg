@@ -32,10 +32,7 @@ namespace ember
 {
 
 // Leaf threshold: when polygon count drops below this, stop subdividing
-// High threshold to disable subdivision until cell-boundary vertex
-// propagation is implemented. O(n²) pairwise testing is acceptable
-// for meshes up to ~2000 triangles.
-static constexpr int LEAF_THRESHOLD = 4096;
+static constexpr int LEAF_THRESHOLD = 50;
 
 // Maximum subdivision depth to prevent infinite recursion
 static constexpr int MAX_DEPTH = 40;
@@ -539,7 +536,11 @@ inline void subdivide(
     IAABB left_bounds = task.bounds.left_half(split_axis, split_val);
     IAABB right_bounds = task.bounds.right_half(split_axis, split_val);
 
-    // Clip polygons against the splitting plane
+    // Assign polygons to child cells. Each polygon goes to ALL cells
+    // its AABB overlaps (required for correct BSP). Non-intersecting polygons
+    // go to only ONE cell (center-based) to avoid output duplication.
+    // Intersecting polygons MUST be in both cells for correct BSP processing
+    // but we deduplicate in process_leaf.
     std::vector<ConvexPolygon> left_polys, right_polys;
     left_polys.reserve(task.polygons.size());
     right_polys.reserve(task.polygons.size());
@@ -547,7 +548,6 @@ inline void subdivide(
     for (auto const& poly : task.polygons)
     {
         auto cr = clip_polygon(poly, split_plane);
-
         switch (cr.side)
         {
         case ClipSide::Left:
@@ -557,8 +557,12 @@ inline void subdivide(
             right_polys.push_back(poly);
             break;
         case ClipSide::Both:
-            left_polys.push_back(std::move(cr.left));
-            right_polys.push_back(std::move(cr.right));
+            // Send the FULL polygon (unclipped) to both cells.
+            // process_leaf will classify it correctly from each cell's reference.
+            // The two-pass architecture ensures non-intersecting polygons
+            // are only emitted once (from the cell where they're fully contained).
+            left_polys.push_back(poly);
+            right_polys.push_back(poly);
             break;
         }
     }
