@@ -35,10 +35,39 @@ struct ClipResult
 // Clip a convex polygon against a plane.
 // "Left" = negative side of plane (classify <= 0)
 // "Right" = positive side (classify >= 0)
+// Fast-path: determine split axis and value from an axis-aligned split plane.
+// Returns -1 if the plane is not axis-aligned.
+inline int split_plane_axis(plane_t const& p, double& val)
+{
+    int64_t a = int64_t(p.a), b = int64_t(p.b), c = int64_t(p.c);
+    if (a != 0 && b == 0 && c == 0) { val = -double(int64_t(p.d)) / double(a); return 0; }
+    if (a == 0 && b != 0 && c == 0) { val = -double(int64_t(p.d)) / double(b); return 1; }
+    if (a == 0 && b == 0 && c != 0) { val = -double(int64_t(p.d)) / double(c); return 2; }
+    return -1;
+}
+
 inline ClipResult clip_polygon(ConvexPolygon const& poly, plane_t const& split_plane)
 {
     int n = poly.vertex_count();
     if (n < 3) return {poly, {}, ClipSide::Left};
+
+    // Fast-path: if polygon has approximate AABB and the split plane is
+    // axis-aligned, check if the polygon is entirely on one side.
+    if (poly.has_approx_bounds)
+    {
+        double split_val;
+        int axis = split_plane_axis(split_plane, split_val);
+        if (axis >= 0)
+        {
+            int32_t ival = int32_t(std::round(split_val));
+            // Conservative: polygon entirely on negative side if all vertices < split
+            if (poly.approx_max[axis] < ival)
+                return {poly, {}, ClipSide::Left};
+            // Conservative: polygon entirely on positive side if all vertices > split
+            if (poly.approx_min[axis] > ival)
+                return {{}, poly, ClipSide::Right};
+        }
+    }
 
     // Step 1: Classify each vertex against the splitting plane
     std::vector<tg::i8> c(n);
@@ -124,6 +153,26 @@ inline ClipResult clip_polygon(ConvexPolygon const& poly, plane_t const& split_p
     result.left.delta_w = poly.delta_w;
     result.left.no_self_intersections = poly.no_self_intersections;
     result.left.no_nested_components = poly.no_nested_components;
+
+    // Update approximate AABBs for clipped halves
+    if (poly.has_approx_bounds)
+    {
+        double split_val;
+        int axis = split_plane_axis(split_plane, split_val);
+        if (axis >= 0)
+        {
+            int32_t ival = int32_t(std::round(split_val));
+            // Left half: clamp max along split axis
+            for (int a = 0; a < 3; a++) { result.left.approx_min[a] = poly.approx_min[a]; result.left.approx_max[a] = poly.approx_max[a]; }
+            result.left.approx_max[axis] = std::min(result.left.approx_max[axis], ival);
+            result.left.has_approx_bounds = true;
+
+            // Right half: clamp min along split axis
+            for (int a = 0; a < 3; a++) { result.right.approx_min[a] = poly.approx_min[a]; result.right.approx_max[a] = poly.approx_max[a]; }
+            result.right.approx_min[axis] = std::max(result.right.approx_min[axis], ival);
+            result.right.has_approx_bounds = true;
+        }
+    }
 
     result.right.support = poly.support;
     result.right.edges = std::move(right_edges);

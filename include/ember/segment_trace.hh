@@ -52,8 +52,30 @@ inline WNV trace_axis_segment(
     plane_t bound_start = axis_plane(axis, (&start.x)[axis]);
     plane_t bound_end   = axis_plane(axis, (&end.x)[axis]);
 
+    // Compute integer AABB of the segment for fast culling
+    int32_t seg_min[3], seg_max[3];
+    for (int a = 0; a < 3; a++)
+    {
+        int32_t sa = int32_t((&start.x)[a]);
+        int32_t ea = int32_t((&end.x)[a]);
+        seg_min[a] = std::min(sa, ea) - 1;
+        seg_max[a] = std::max(sa, ea) + 1;
+    }
+
     for (auto const& poly : polygons)
     {
+        // Fast AABB culling: skip polygons that can't intersect the segment
+        if (poly.has_approx_bounds)
+        {
+            bool skip = false;
+            for (int a = 0; a < 3; a++)
+            {
+                if (poly.approx_max[a] < seg_min[a] || poly.approx_min[a] > seg_max[a])
+                { skip = true; break; }
+            }
+            if (skip) continue;
+        }
+
         auto sn = poly.support.normal();
         if (int64_t((&sn.x)[axis]) == 0) continue;
 
@@ -179,16 +201,14 @@ inline WNV point_in_meshes_robust(
     return result;
 }
 
-// Probe: center + 10% edge offset along dominant normal
+// Probe: center + offset along dominant normal.
+// Uses cached AABB when available to avoid expensive vertex_dpos calls.
 inline bool find_probe_point(ConvexPolygon const& poly, pos_t& out_probe, int& out_side)
 {
     int n = poly.vertex_count();
     if (n < 3) return false;
-    tg::dpos3 center = {0,0,0};
-    for (int i = 0; i < n; i++)
-    { auto dp = poly.vertex_dpos(i); center.x+=dp.x; center.y+=dp.y; center.z+=dp.z; }
-    center.x/=n; center.y/=n; center.z/=n;
 
+    // Determine dominant normal axis and direction
     auto sn = poly.support.normal();
     auto aa = ipg::abs(int64_t(sn.x)), ab = ipg::abs(int64_t(sn.y)), ac = ipg::abs(int64_t(sn.z));
     int dom = 0;
@@ -196,13 +216,39 @@ inline bool find_probe_point(ConvexPolygon const& poly, pos_t& out_probe, int& o
     else if (ac > aa && ac > ab) dom = 2;
     int dir = (int64_t((&sn.x)[dom]) > 0) ? 1 : -1;
 
-    double edge_len = 0;
-    for (int i = 0; i < n; i++) {
-        auto vi = poly.vertex_dpos(i); auto vj = poly.vertex_dpos((i+1)%n);
-        double dx=vi.x-vj.x,dy=vi.y-vj.y,dz=vi.z-vj.z;
-        edge_len = std::max(edge_len, std::sqrt(dx*dx+dy*dy+dz*dz));
+    tg::dpos3 center;
+    int offset;
+
+    if (poly.has_approx_bounds)
+    {
+        // Fast path: use integer AABB center as approximate polygon center
+        center.x = double(poly.approx_min[0] + poly.approx_max[0]) * 0.5;
+        center.y = double(poly.approx_min[1] + poly.approx_max[1]) * 0.5;
+        center.z = double(poly.approx_min[2] + poly.approx_max[2]) * 0.5;
+
+        // Estimate edge length from AABB diagonal
+        double ddx = poly.approx_max[0] - poly.approx_min[0];
+        double ddy = poly.approx_max[1] - poly.approx_min[1];
+        double ddz = poly.approx_max[2] - poly.approx_min[2];
+        double diag = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+        offset = std::max(int32_t(diag * 0.15), int32_t(2));
     }
-    int offset = std::max(int32_t(edge_len * 0.1), int32_t(2));
+    else
+    {
+        // Slow path: compute vertex positions
+        center = {0, 0, 0};
+        for (int i = 0; i < n; i++)
+        { auto dp = poly.vertex_dpos(i); center.x+=dp.x; center.y+=dp.y; center.z+=dp.z; }
+        center.x /= n; center.y /= n; center.z /= n;
+
+        double edge_len = 0;
+        for (int i = 0; i < n; i++) {
+            auto vi = poly.vertex_dpos(i); auto vj = poly.vertex_dpos((i+1)%n);
+            double ddx=vi.x-vj.x, ddy=vi.y-vj.y, ddz=vi.z-vj.z;
+            edge_len = std::max(edge_len, std::sqrt(ddx*ddx+ddy*ddy+ddz*ddz));
+        }
+        offset = std::max(int32_t(edge_len * 0.1), int32_t(2));
+    }
 
     pos_t probe(pos_scalar_t(int32_t(std::round(center.x))),
                 pos_scalar_t(int32_t(std::round(center.y))),

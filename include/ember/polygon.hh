@@ -30,6 +30,14 @@ struct ConvexPolygon
     bool no_self_intersections = false; // NSI flag
     bool no_nested_components = false;  // NNC flag
 
+    // Cached approximate AABB in INTEGER space for fast-path spatial queries.
+    // Set during prepare_input from integer vertex positions, updated
+    // conservatively during clip_polygon. Allows skipping expensive
+    // exact_classify calls when a polygon is clearly on one side of a split.
+    int32_t approx_min[3] = {-MAX_COORD, -MAX_COORD, -MAX_COORD};
+    int32_t approx_max[3] = { MAX_COORD,  MAX_COORD,  MAX_COORD};
+    bool has_approx_bounds = false;
+
     int vertex_count() const { return static_cast<int>(edges.size()); }
 
     // Compute vertex i as intersection of support, edges[i], edges[(i+1)%n]

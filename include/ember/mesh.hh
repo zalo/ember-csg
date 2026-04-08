@@ -187,6 +187,15 @@ inline PolygonSoup prepare_input(std::vector<InputMesh> const& meshes)
             poly.no_self_intersections = mesh.nsi;
             poly.no_nested_components = mesh.nnc;
 
+            // Set approximate AABB from integer positions
+            for (int a = 0; a < 3; a++)
+            {
+                int32_t i0 = int32_t((&p0.x)[a]), i1 = int32_t((&p1.x)[a]), i2 = int32_t((&p2.x)[a]);
+                poly.approx_min[a] = std::min({i0, i1, i2});
+                poly.approx_max[a] = std::max({i0, i1, i2});
+            }
+            poly.has_approx_bounds = true;
+
             soup.polygons.push_back(std::move(poly));
             poly_index++;
         }
