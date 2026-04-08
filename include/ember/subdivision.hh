@@ -24,12 +24,33 @@
 #include <ember/winding.hh>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <vector>
 
 namespace ember
 {
+
+// Profiling counters (reset before each boolean_operation)
+struct SubdivisionProfile {
+    double ms_clip = 0;           // Polygon clipping at split planes
+    double ms_ref_propagation = 0;// Reference point WNV propagation (includes BVH build)
+    double ms_bvh_build = 0;     // BVH construction (subset of ref_propagation + leaf_isect)
+    double ms_compute_split = 0;  // Split plane computation
+    double ms_leaf_isect = 0;     // Leaf: pairwise intersection detection
+    double ms_leaf_bsp = 0;       // Leaf: BSP construction
+    double ms_leaf_classify = 0;  // Leaf: polygon classification (segment trace)
+    int n_leaves = 0;
+    int n_leaf_polys = 0;
+    int n_classify_calls = 0;
+    int n_subdivide_calls = 0;
+};
+inline SubdivisionProfile g_profile;
+using HiClock = std::chrono::high_resolution_clock;
+inline double ms_since(HiClock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(HiClock::now() - t0).count();
+}
 
 // Leaf threshold: when polygon count drops below this, stop subdividing
 static constexpr int LEAF_THRESHOLD = 25;
@@ -80,125 +101,14 @@ inline tg::dpos3 compute_center_of_gravity(std::vector<ConvexPolygon> const& pol
     return sum;
 }
 
-// Compute splitting plane using center-of-gravity heuristic (Section 4.5.3)
-// Tries to separate different WNTV classes
+// Compute splitting plane: midpoint of longest AABB axis.
+// This is O(1) per subdivision level. The paper's CoG heuristic (Section 4.5.3)
+// gives marginally better splits but costs O(n) per level due to expensive
+// vertex_dpos calls in center_of_gravity.
 inline void compute_split(SubdivisionTask const& task, int& out_axis, pos_scalar_t& out_val)
 {
     auto const& bounds = task.bounds;
-
-    // Group polygons by WNTV
-    struct WNTVGroup
-    {
-        WNTV key;
-        tg::dpos3 center;
-        int count = 0;
-        double variance[3] = {0, 0, 0};
-    };
-
-    std::vector<WNTVGroup> groups;
-    for (auto const& poly : task.polygons)
-    {
-        // Find or create group
-        WNTVGroup* group = nullptr;
-        for (auto& g : groups)
-        {
-            if (g.key == poly.delta_w) { group = &g; break; }
-        }
-        if (!group)
-        {
-            groups.push_back({poly.delta_w, {0,0,0}, 0, {0,0,0}});
-            group = &groups.back();
-        }
-
-        auto c = poly.center_of_gravity();
-        group->center.x += c.x;
-        group->center.y += c.y;
-        group->center.z += c.z;
-        group->count++;
-    }
-
-    // Finalize centers
-    for (auto& g : groups)
-    {
-        if (g.count > 0)
-        {
-            g.center.x /= g.count;
-            g.center.y /= g.count;
-            g.center.z /= g.count;
-        }
-    }
-
-    // Try to find a split that separates groups
-    if (groups.size() >= 2)
-    {
-        // Find the axis with greatest separation between group centers
-        double best_sep = 0;
-        int best_axis = -1;
-        double best_val = 0;
-
-        for (int axis = 0; axis < 3; axis++)
-        {
-            for (size_t i = 0; i < groups.size(); i++)
-            {
-                for (size_t j = i + 1; j < groups.size(); j++)
-                {
-                    double ci = (&groups[i].center.x)[axis];
-                    double cj = (&groups[j].center.x)[axis];
-                    double mid = (ci + cj) * 0.5;
-                    double sep = std::abs(ci - cj);
-
-                    // Check that mid is within bounds
-                    double bmin = double((&bounds.min.x)[axis]);
-                    double bmax = double((&bounds.max.x)[axis]);
-                    if (mid >= bmin + 1 && mid <= bmax - 1 && sep > best_sep)
-                    {
-                        best_sep = sep;
-                        best_axis = axis;
-                        best_val = mid;
-                    }
-                }
-            }
-        }
-
-        if (best_axis >= 0)
-        {
-            out_axis = best_axis;
-            out_val = pos_scalar_t(int32_t(std::round(best_val)));
-            // Clamp to valid range
-            auto bmin = (&bounds.min.x)[out_axis];
-            auto bmax = (&bounds.max.x)[out_axis];
-            if (out_val <= bmin) out_val = bmin + pos_scalar_t(1);
-            if (out_val >= bmax) out_val = bmax - pos_scalar_t(1);
-            return;
-        }
-    }
-
-    // Fallback: largest variance split or simple midpoint
-    // Compute variance along each axis
-    double var[3] = {0, 0, 0};
-    auto cog = compute_center_of_gravity(task.polygons);
-    for (auto const& poly : task.polygons)
-    {
-        auto c = poly.center_of_gravity();
-        for (int a = 0; a < 3; a++)
-        {
-            double d = (&c.x)[a] - (&cog.x)[a];
-            var[a] += d * d;
-        }
-    }
-
-    // Pick axis with largest variance, or longest axis
     out_axis = bounds.longest_axis();
-    double max_var = 0;
-    for (int a = 0; a < 3; a++)
-    {
-        if (var[a] > max_var && bounds.extent(a) > pos_scalar_t(2))
-        {
-            max_var = var[a];
-            out_axis = a;
-        }
-    }
-
     out_val = bounds.midpoint(out_axis);
 
     // Ensure split position is strictly between bounds
@@ -221,7 +131,7 @@ inline bool compute_new_reference(
     std::vector<ConvexPolygon> const& polygons,
     pos_t& new_ref,
     WNV& new_wnv,
-    BVH const* = nullptr)
+    BVH const* bvh = nullptr)
 {
     // If old reference is still inside the new bounds, keep it
     if (new_bounds.contains(old_ref))
@@ -252,6 +162,8 @@ inline bool compute_new_reference(
         new_wnv = old_wnv;
         return true;
     }
+
+    BVH const* bvh_ptr = bvh;
 
     // Try multiple target positions along the projection axis with small offsets
     // to avoid landing on polygon edges.
@@ -345,9 +257,9 @@ inline void process_leaf(
     int n = static_cast<int>(polygons.size());
 
     if (n == 0) return;
+    g_profile.n_leaves++;
+    g_profile.n_leaf_polys += n;
 
-    // With exact segment tracing and reliable reference propagation,
-    // classification is LOCAL — we only need this leaf's polygons.
     auto const& class_polys = polygons;
 
     // Optimization from Section 4.5.1: if all polygons have the same WNTV
@@ -415,15 +327,15 @@ inline void process_leaf(
         return;
     }
 
-    // Two-pass approach with BVH acceleration:
-    // Build per-mesh BVHs, use dual-BVH traversal to find intersecting pairs.
-    // Only test geometric intersection for AABB-overlapping cross-mesh pairs.
+    // Two-pass approach with BVH acceleration
+    auto t_isect_start = HiClock::now();
 
     // Build per-mesh BVHs
     std::map<int, std::vector<int>> mesh_poly_map; // mesh_index → polygon indices
     for (int i = 0; i < n; i++)
         mesh_poly_map[polygons[i].mesh_index].push_back(i);
 
+    auto t_bvh_leaf = HiClock::now();
     std::map<int, BVH> mesh_bvhs;
     for (auto& [mesh_id, poly_ids] : mesh_poly_map)
     {
@@ -432,6 +344,7 @@ inline void process_leaf(
         for (int idx : poly_ids) mesh_polys.push_back(polygons[idx]);
         mesh_bvhs[mesh_id].build(mesh_polys);
     }
+    g_profile.ms_bvh_build += ms_since(t_bvh_leaf);
 
     // Dual-BVH: find cross-mesh AABB-overlapping pairs
     std::vector<std::vector<PairwiseIntersection>> all_isects(n);
@@ -467,6 +380,9 @@ inline void process_leaf(
         }
     }
 
+    g_profile.ms_leaf_isect += ms_since(t_isect_start);
+
+    auto t_classify_start = HiClock::now();
     for (int i = 0; i < n; i++)
     {
         auto const& poly_i = polygons[i];
@@ -491,7 +407,10 @@ inline void process_leaf(
         }
     }
 
+    g_profile.ms_leaf_classify += ms_since(t_classify_start);
+
     // Pass 2: BSP-split intersecting polygons
+    auto t_bsp_start = HiClock::now();
     for (int i = 0; i < n; i++)
     {
         if (all_isects[i].empty()) continue;
@@ -537,6 +456,7 @@ inline void process_leaf(
             }
         }
     }
+    g_profile.ms_leaf_bsp += ms_since(t_bsp_start);
 }
 
 // Main recursive subdivision function
@@ -585,10 +505,14 @@ inline void subdivide(
         return;
     }
 
+    g_profile.n_subdivide_calls++;
+    auto t_split = HiClock::now();
+
     // Compute splitting plane
     int split_axis;
     pos_scalar_t split_val;
     compute_split(task, split_axis, split_val);
+    g_profile.ms_compute_split += ms_since(t_split);
 
     plane_t split_plane = task.bounds.splitting_plane(split_axis, split_val);
 
@@ -601,6 +525,7 @@ inline void subdivide(
     // go to only ONE cell (center-based) to avoid output duplication.
     // Intersecting polygons MUST be in both cells for correct BSP processing
     // but we deduplicate in process_leaf.
+    auto t_clip = HiClock::now();
     std::vector<ConvexPolygon> left_polys, right_polys;
     left_polys.reserve(task.polygons.size());
     right_polys.reserve(task.polygons.size());
@@ -623,20 +548,18 @@ inline void subdivide(
         }
     }
 
-    // Build BVH over current (pre-clip) polygons for reference propagation.
-    // Reference propagation needs the polygons BEFORE clipping since the
-    // trace path may cross the split plane.
-    BVH ref_bvh;
-    ref_bvh.build(task.polygons);
+    g_profile.ms_clip += ms_since(t_clip);
 
-    // Compute reference points for each child
+    auto t_ref = HiClock::now();
     pos_t left_ref, right_ref;
     WNV left_wnv, right_wnv;
 
     compute_new_reference(task.ref_point, task.ref_wnv, left_bounds,
-                          task.polygons, left_ref, left_wnv, &ref_bvh);
+                          task.polygons, left_ref, left_wnv);
     compute_new_reference(task.ref_point, task.ref_wnv, right_bounds,
-                          task.polygons, right_ref, right_wnv, &ref_bvh);
+                          task.polygons, right_ref, right_wnv);
+
+    g_profile.ms_ref_propagation += ms_since(t_ref);
 
     SubdivisionTask left_task;
     left_task.polygons = std::move(left_polys);

@@ -90,8 +90,18 @@ inline BooleanResult boolean_operation(
     initial_task.depth = 0;
 
     // Step 5: Run subdivision and classification
+    g_profile = {};
     std::vector<ClassifiedPolygon> classified;
     subdivide(std::move(initial_task), indicator, classified);
+
+    auto& p = g_profile;
+    double total = p.ms_clip + p.ms_ref_propagation + p.ms_compute_split +
+                   p.ms_leaf_isect + p.ms_leaf_bsp + p.ms_leaf_classify;
+    std::printf("[profile] split=%.1f clip=%.1f ref=%.1f bvh=%.1f | isect=%.1f classify=%.1f bsp=%.1f | total=%.1fms\n",
+        p.ms_compute_split, p.ms_clip, p.ms_ref_propagation, p.ms_bvh_build,
+        p.ms_leaf_isect, p.ms_leaf_classify, p.ms_leaf_bsp, total);
+    std::printf("[profile] subdivide_calls=%d leaves=%d leaf_polys=%d\n",
+        p.n_subdivide_calls, p.n_leaves, p.n_leaf_polys);
 
     // Step 6: Assemble output
     result.output.num_meshes = soup.num_meshes;
