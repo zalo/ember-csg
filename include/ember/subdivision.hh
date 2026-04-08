@@ -14,6 +14,7 @@
 //
 // Leaf threshold: 25 polygons (optimal per paper's profiling)
 
+#include <ember/bvh.hh>
 #include <ember/clip.hh>
 #include <ember/intersect_polygons.hh>
 #include <ember/local_bsp.hh>
@@ -329,36 +330,72 @@ inline void process_leaf(
         return;
     }
 
-    // Two-pass approach:
-    // Pass 1: Classify all polygons directly (no BSP). This gives the correct
-    //         WNV for polygons that don't intersect any other-mesh polygon.
-    // Pass 2: For polygons that DO intersect, BSP-split and reclassify the leaves.
+    // Two-pass approach with BVH acceleration:
+    // Build per-mesh BVHs, use dual-BVH traversal to find intersecting pairs.
+    // Only test geometric intersection for AABB-overlapping cross-mesh pairs.
 
-    // Pass 1: find intersections and classify non-intersecting polygons
+    // Build per-mesh BVHs
+    std::map<int, std::vector<int>> mesh_poly_map; // mesh_index → polygon indices
+    for (int i = 0; i < n; i++)
+        mesh_poly_map[polygons[i].mesh_index].push_back(i);
+
+    std::map<int, BVH> mesh_bvhs;
+    for (auto& [mesh_id, poly_ids] : mesh_poly_map)
+    {
+        std::vector<ConvexPolygon> mesh_polys;
+        mesh_polys.reserve(poly_ids.size());
+        for (int idx : poly_ids) mesh_polys.push_back(polygons[idx]);
+        mesh_bvhs[mesh_id].build(mesh_polys);
+    }
+
+    // Dual-BVH: find cross-mesh AABB-overlapping pairs
     std::vector<std::vector<PairwiseIntersection>> all_isects(n);
+
+    auto mesh_ids = std::vector<int>();
+    for (auto& [k, v] : mesh_poly_map) mesh_ids.push_back(k);
+
+    for (size_t mi = 0; mi < mesh_ids.size(); mi++)
+    {
+        for (size_t mj = mi + 1; mj < mesh_ids.size(); mj++)
+        {
+            int mid_i = mesh_ids[mi], mid_j = mesh_ids[mj];
+            auto& bvh_i = mesh_bvhs[mid_i];
+            auto& bvh_j = mesh_bvhs[mid_j];
+            auto& ids_i = mesh_poly_map[mid_i];
+            auto& ids_j = mesh_poly_map[mid_j];
+
+            bvh_i.intersect_pairs(bvh_j, [&](int local_i, int local_j) {
+                int gi = ids_i[local_i]; // global polygon index
+                int gj = ids_j[local_j];
+
+                // Geometric intersection test
+                auto isect_ij = intersect_polygons(polygons[gi], polygons[gj], gj);
+                if (isect_ij.type == PairwiseIntersection::Type::Segment ||
+                    isect_ij.type == PairwiseIntersection::Type::Overlap)
+                    all_isects[gi].push_back(isect_ij);
+
+                auto isect_ji = intersect_polygons(polygons[gj], polygons[gi], gi);
+                if (isect_ji.type == PairwiseIntersection::Type::Segment ||
+                    isect_ji.type == PairwiseIntersection::Type::Overlap)
+                    all_isects[gj].push_back(isect_ji);
+            });
+        }
+    }
+
+    // Build a combined BVH for accelerated raycast in WNV classification
+    BVH combined_bvh;
+    combined_bvh.build(polygons);
 
     for (int i = 0; i < n; i++)
     {
         auto const& poly_i = polygons[i];
-        for (int j = 0; j < n; j++)
-        {
-            if (i == j) continue;
-            if (poly_i.no_self_intersections &&
-                polygons[j].mesh_index == poly_i.mesh_index)
-                continue;
-
-            auto isect = intersect_polygons(poly_i, polygons[j], j);
-            if (isect.type == PairwiseIntersection::Type::Segment ||
-                isect.type == PairwiseIntersection::Type::Overlap)
-                all_isects[i].push_back(std::move(isect));
-        }
 
         if (all_isects[i].empty())
         {
             // No intersections: classify directly using the original polygon
             WNV w_front = classify_leaf_polygon(
                 poly_i.support, poly_i.edges, task.ref_point, task.ref_wnv,
-                polygons, task.root_bounds, poly_i.delta_w);
+                polygons, task.root_bounds, poly_i.delta_w, &combined_bvh);
             WNV w_back = propagate_wnv(w_front, 1, poly_i.delta_w);
             int cls = classify_polygon_output(w_front, w_back, indicator);
 
@@ -400,7 +437,7 @@ inline void process_leaf(
 
             WNV w_front = classify_leaf_polygon(
                 poly_i.support, leaf->edges, task.ref_point, task.ref_wnv,
-                polygons, task.root_bounds, poly_i.delta_w);
+                polygons, task.root_bounds, poly_i.delta_w, &combined_bvh);
             WNV w_back = propagate_wnv(w_front, 1, poly_i.delta_w);
             int cls = classify_polygon_output(w_front, w_back, indicator);
 

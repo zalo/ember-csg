@@ -9,6 +9,7 @@
 // uses double precision, matching the paper's note that classification
 // can use fast approximate methods when the geometry is exact.
 
+#include <ember/bvh.hh>
 #include <ember/polygon.hh>
 #include <ember/types.hh>
 #include <ember/winding.hh>
@@ -71,12 +72,13 @@ inline void cast_ray_parity(
     }
 }
 
-// Robust point-in-meshes test: cast 7 rays in different directions,
-// take majority vote per mesh for inside/outside.
+// Robust point-in-meshes test with BVH acceleration.
+// Cast 7 rays, use BVH to quickly find candidate triangles, majority vote.
 inline WNV point_in_meshes_robust(
     double px, double py, double pz,
     std::vector<ConvexPolygon> const& polygons,
-    int num_meshes)
+    int num_meshes,
+    BVH const* bvh = nullptr)  // optional BVH for acceleration
 {
     static const double dirs[][3] = {
         { 0.85065, 0.52573, 0.03532},
@@ -93,7 +95,32 @@ inline WNV point_in_meshes_robust(
     for (auto& d : dirs)
     {
         std::vector<int> crossings(num_meshes, 0);
-        cast_ray_parity(px, py, pz, d[0], d[1], d[2], polygons, num_meshes, crossings);
+
+        if (bvh)
+        {
+            // BVH-accelerated: only test triangles whose AABB is hit by the ray
+            bvh->raycast(px, py, pz, d[0], d[1], d[2], [&](int pi) {
+                auto const& poly = polygons[pi];
+                if (poly.mesh_index < 0 || poly.mesh_index >= num_meshes) return;
+                int nv = poly.vertex_count();
+                if (nv < 3) return;
+                auto v0 = poly.vertex_dpos(0);
+                for (int k = 1; k < nv - 1; k++)
+                {
+                    auto v1 = poly.vertex_dpos(k);
+                    auto v2 = poly.vertex_dpos(k + 1);
+                    double t = ray_tri_hit(px, py, pz, d[0], d[1], d[2],
+                        v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
+                    if (t > 1e-6) crossings[poly.mesh_index]++;
+                }
+            });
+        }
+        else
+        {
+            // Brute-force fallback
+            cast_ray_parity(px, py, pz, d[0], d[1], d[2], polygons, num_meshes, crossings);
+        }
+
         for (int m = 0; m < num_meshes; m++)
             if (crossings[m] & 1) votes[m]++;
     }
@@ -176,7 +203,8 @@ inline WNV classify_leaf_polygon(
     WNV const& ref_wnv,
     std::vector<ConvexPolygon> const& polygons,
     IAABB const& aabb,
-    WNTV const& host_delta_w)
+    WNTV const& host_delta_w,
+    BVH const* bvh = nullptr)
 {
     // Build a temporary ConvexPolygon for probe point finding
     ConvexPolygon tmp_poly;
@@ -196,7 +224,7 @@ inline WNV classify_leaf_polygon(
     // vertex_dpos also returns integer-space coordinates.
     double px = double(probe.x), py = double(probe.y), pz = double(probe.z);
 
-    WNV wnv = point_in_meshes_robust(px, py, pz, polygons, num_meshes);
+    WNV wnv = point_in_meshes_robust(px, py, pz, polygons, num_meshes, bvh);
 
     if (probe_side > 0)
         return wnv;
