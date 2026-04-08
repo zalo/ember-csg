@@ -32,7 +32,7 @@ namespace ember
 {
 
 // Leaf threshold: when polygon count drops below this, stop subdividing
-static constexpr int LEAF_THRESHOLD = 50;
+static constexpr int LEAF_THRESHOLD = 4096;
 
 // Maximum subdivision depth to prevent infinite recursion
 static constexpr int MAX_DEPTH = 40;
