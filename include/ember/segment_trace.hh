@@ -1,18 +1,15 @@
 #pragma once
 
-// EMBER - WNV Classification via robust multi-ray casting.
+// EMBER - WNV Classification via robust multi-ray casting + exact segment trace.
 //
-// Matches the aa1b8b6 "manifold-producing" state, with BVH acceleration.
-//
-// Algorithm:
-//   1. Find probe point: polygon center + 10% edge-length offset along normal
-//   2. Cast 7 rays in random directions, count parity per mesh (majority vote)
-//   3. NO coplanar skip (probe is off-surface, all crossings are real)
-//   4. Side correction: if probe on back (negative) side, subtract delta_w
+// Two modes:
+//   1. point_in_meshes_robust: 7-ray majority vote, BVH-accelerated (for leaf classification)
+//   2. trace_axis_segment: exact integer segment trace (for reference propagation)
 
 #include <ember/bvh.hh>
 #include <ember/polygon.hh>
 #include <ember/types.hh>
+#include <ember/exact_classify.hh>
 #include <ember/winding.hh>
 
 #include <cmath>
@@ -20,6 +17,103 @@
 
 namespace ember
 {
+
+// ---------------------------------------------------------------------------
+// Axis-aligned plane + exact segment trace (for reference propagation)
+// ---------------------------------------------------------------------------
+
+inline plane_t axis_plane(int axis, pos_scalar_t val)
+{
+    plane_t p;
+    p.a = normal_scalar_t(axis == 0 ? 1 : 0);
+    p.b = normal_scalar_t(axis == 1 ? 1 : 0);
+    p.c = normal_scalar_t(axis == 2 ? 1 : 0);
+    p.d = plane_d_t(-int64_t(val));
+    return p;
+}
+
+// Exact axis-aligned segment trace. Accumulates WNV transitions for all
+// polygon crossings along the segment.
+inline WNV trace_axis_segment(
+    pos_t const& start, pos_t const& end, int axis,
+    WNV const& start_wnv,
+    std::vector<ConvexPolygon> const& polygons,
+    bool& valid)
+{
+    valid = true;
+    WNV wnv = start_wnv;
+
+    int ax1 = (axis + 1) % 3;
+    int ax2 = (axis + 2) % 3;
+    plane_t lp0 = axis_plane(ax1, (&start.x)[ax1]);
+    plane_t lp1 = axis_plane(ax2, (&start.x)[ax2]);
+
+    int dir_sign = (int32_t((&start.x)[axis]) < int32_t((&end.x)[axis])) ? 1 : -1;
+    plane_t bound_start = axis_plane(axis, (&start.x)[axis]);
+    plane_t bound_end   = axis_plane(axis, (&end.x)[axis]);
+
+    for (auto const& poly : polygons)
+    {
+        auto sn = poly.support.normal();
+        if (int64_t((&sn.x)[axis]) == 0) continue;
+
+        auto pt = ipg::intersect(lp0, lp1, poly.support);
+        if (!pt.is_valid()) continue;
+
+        auto cs = exact_classify(pt, bound_start);
+        auto ce = exact_classify(pt, bound_end);
+
+        if (dir_sign > 0) { if (cs <= 0 || ce >= 0) continue; }
+        else              { if (cs >= 0 || ce <= 0) continue; }
+
+        bool inside = true;
+        bool on_edge = false;
+        for (auto const& edge : poly.edges)
+        {
+            auto c = exact_classify(pt, edge);
+            if (c > 0) { inside = false; break; }
+            if (c == 0) on_edge = true;
+        }
+        if (!inside) continue;
+        if (on_edge) { valid = false; return wnv; }
+
+        int cross_sign = (int64_t((&sn.x)[axis]) > 0 ? 1 : -1) * (-dir_sign);
+        for (size_t k = 0; k < wnv.size() && k < poly.delta_w.size(); k++)
+            wnv[k] += cross_sign * poly.delta_w[k];
+    }
+    return wnv;
+}
+
+// trace_segment: exact L-path trace for reference propagation.
+inline WNV trace_segment(pos_t const& start, pos_t const& end, WNV const& wnv,
+    std::vector<ConvexPolygon> const& polys, plane_t const&, int,
+    BVH const* = nullptr)
+{
+    static const int orderings[][3] = {{0,1,2}, {1,2,0}, {2,0,1}};
+    for (auto& ord : orderings)
+    {
+        bool valid = true;
+        WNV attempt = wnv;
+        pos_t cur = start;
+        for (int i = 0; i < 3 && valid; i++)
+        {
+            int ax = ord[i];
+            if ((&cur.x)[ax] != (&end.x)[ax])
+            {
+                pos_t next = cur;
+                (&next.x)[ax] = (&end.x)[ax];
+                attempt = trace_axis_segment(cur, next, ax, attempt, polys, valid);
+                cur = next;
+            }
+        }
+        if (valid) return attempt;
+    }
+    return wnv; // fallback
+}
+
+// ---------------------------------------------------------------------------
+// 7-ray robust point-in-mesh (for leaf polygon classification)
+// ---------------------------------------------------------------------------
 
 inline double ray_tri_hit(double ox,double oy,double oz,
                           double dx,double dy,double dz,
@@ -42,7 +136,7 @@ inline double ray_tri_hit(double ox,double oy,double oz,
     return f*(e2x*qx+e2y*qy+e2z*qz);
 }
 
-// 7-ray majority vote, NO coplanar skip, BVH-accelerated
+// 7-ray majority vote, BVH-accelerated
 inline WNV point_in_meshes_robust(
     double px, double py, double pz,
     std::vector<ConvexPolygon> const& polygons, int num_meshes,
@@ -142,28 +236,70 @@ inline bool find_interior_point(ConvexPolygon const& poly, pos_t& out)
     return false;
 }
 
-// Classify using aa1b8b6 logic: probe + robust multi-ray + side correction
+// Classify a leaf polygon via exact segment tracing from the reference point.
+// Finds a probe point off the polygon surface, traces an L-path from ref
+// to probe through the local polygon set, accumulating WNV transitions.
 inline WNV classify_leaf_polygon(
     plane_t const& support, std::vector<plane_t> const& leaf_edges,
-    pos_t const& /*ref*/, WNV const& ref_wnv,
-    std::vector<ConvexPolygon> const& polygons, IAABB const& /*aabb*/,
-    WNTV const& host_delta_w, int /*host_mesh*/ = -1, BVH const* bvh = nullptr)
+    pos_t const& ref_point, WNV const& ref_wnv,
+    std::vector<ConvexPolygon> const& polygons, IAABB const& aabb,
+    WNTV const& host_delta_w, int /*host_mesh*/ = -1, BVH const* = nullptr)
 {
-    ConvexPolygon tmp; tmp.support = support; tmp.edges = leaf_edges;
-    pos_t probe; int probe_side;
-    if (!find_probe_point(tmp, probe, probe_side)) return ref_wnv;
-    int nm = (int)ref_wnv.size();
-    WNV wnv = point_in_meshes_robust(double(probe.x), double(probe.y), double(probe.z), polygons, nm, bvh);
-    if (probe_side > 0) return wnv;
-    for (size_t k = 0; k < wnv.size() && k < host_delta_w.size(); k++) wnv[k] -= host_delta_w[k];
-    return wnv;
-}
+    ConvexPolygon tmp;
+    tmp.support = support;
+    tmp.edges = leaf_edges;
 
-// trace_segment for reference propagation
-inline WNV trace_segment(pos_t const& start, pos_t const& end, WNV const& wnv,
-    std::vector<ConvexPolygon> const& polys, plane_t const&, int, BVH const* bvh = nullptr)
-{
-    return point_in_meshes_robust(double(end.x),double(end.y),double(end.z), polys, (int)wnv.size(), bvh);
+    pos_t probe;
+    int probe_side;
+    if (!find_probe_point(tmp, probe, probe_side))
+        return ref_wnv;
+
+    // Clamp probe to AABB so the L-path stays within the local polygon region
+    for (int a = 0; a < 3; a++)
+    {
+        auto& coord = (&probe.x)[a];
+        auto bmin = (&aabb.min.x)[a] + pos_scalar_t(1);
+        auto bmax = (&aabb.max.x)[a] - pos_scalar_t(1);
+        if (bmin < bmax)
+        {
+            if (coord < bmin) coord = bmin;
+            else if (coord > bmax) coord = bmax;
+        }
+    }
+    // Recompute side after potential clamping
+    probe_side = exact_classify(probe, support);
+    if (probe_side == 0)
+        return ref_wnv;
+
+    // Trace L-path from reference to probe, trying multiple axis orderings
+    static const int orderings[][3] = {{0,1,2}, {1,2,0}, {2,0,1}};
+    for (auto& ord : orderings)
+    {
+        bool valid = true;
+        WNV wnv = ref_wnv;
+        pos_t cur = ref_point;
+        for (int i = 0; i < 3 && valid; i++)
+        {
+            int ax = ord[i];
+            if ((&cur.x)[ax] != (&probe.x)[ax])
+            {
+                pos_t next = cur;
+                (&next.x)[ax] = (&probe.x)[ax];
+                wnv = trace_axis_segment(cur, next, ax, wnv, polygons, valid);
+                cur = next;
+            }
+        }
+        if (valid)
+        {
+            // Side correction
+            if (probe_side < 0)
+                for (size_t k = 0; k < wnv.size() && k < host_delta_w.size(); k++)
+                    wnv[k] -= host_delta_w[k];
+            return wnv;
+        }
+    }
+
+    return ref_wnv; // All paths hit edges — fallback
 }
 
 } // namespace ember

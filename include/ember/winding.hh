@@ -6,6 +6,7 @@
 
 #include <vector>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 
 namespace ember
@@ -107,8 +108,10 @@ inline bool can_early_terminate(WNV const& ref_wnv,
     std::vector<WNV> frontier = {ref_wnv};
     std::vector<WNV> visited = {ref_wnv};
 
-    // Limit search depth to avoid exponential blowup
-    constexpr int MAX_DEPTH = 4;
+    // Search deep enough to find all reachable WNV states.
+    // For n meshes with bounded winding numbers, the reachable set is finite.
+    // Use a generous limit.
+    constexpr int MAX_DEPTH = 8;
 
     for (int depth = 0; depth < MAX_DEPTH && !frontier.empty(); depth++)
     {
@@ -117,25 +120,28 @@ inline bool can_early_terminate(WNV const& ref_wnv,
         {
             for (auto const& dw : available_wntvs)
             {
-                // Apply +dw (crossing in normal direction)
-                WNV w_plus = w;
-                for (size_t i = 0; i < w.size() && i < dw.size(); i++)
-                    w_plus[i] += dw[i];
-
-                // Check if this transition produces useful output
-                if (classify_polygon_output(w, w_plus, indicator) != 0)
-                    return false;
-                if (classify_polygon_output(w_plus, w, indicator) != 0)
-                    return false;
-
-                // Add to frontier if not visited
-                bool found = false;
-                for (auto const& v : visited)
-                    if (v == w_plus) { found = true; break; }
-                if (!found)
+                // Apply +dw (crossing front-to-back) and -dw (crossing back-to-front)
+                for (int sign = -1; sign <= 1; sign += 2)
                 {
-                    visited.push_back(w_plus);
-                    next_frontier.push_back(w_plus);
+                    WNV w_next = w;
+                    for (size_t i = 0; i < w.size() && i < dw.size(); i++)
+                        w_next[i] += sign * dw[i];
+
+                    // Check if this transition produces useful output
+                    if (classify_polygon_output(w, w_next, indicator) != 0)
+                        return false;
+                    if (classify_polygon_output(w_next, w, indicator) != 0)
+                        return false;
+
+                    // Add to frontier if not visited
+                    bool found = false;
+                    for (auto const& v : visited)
+                        if (v == w_next) { found = true; break; }
+                    if (!found)
+                    {
+                        visited.push_back(w_next);
+                        next_frontier.push_back(w_next);
+                    }
                 }
             }
         }

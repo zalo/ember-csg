@@ -32,7 +32,7 @@ namespace ember
 {
 
 // Leaf threshold: when polygon count drops below this, stop subdividing
-static constexpr int LEAF_THRESHOLD = 4096;
+static constexpr int LEAF_THRESHOLD = 25;
 
 // Maximum subdivision depth to prevent infinite recursion
 static constexpr int MAX_DEPTH = 40;
@@ -43,6 +43,7 @@ struct ClassifiedPolygon
     ConvexPolygon polygon;
     WindingPair winding;     // Front and back WNVs
     int classification = 0;  // +1, -1, or 0
+    bool is_bsp_fragment = false; // True if this came from BSP splitting
 };
 
 // A subproblem in the subdivision tree
@@ -54,6 +55,7 @@ struct SubdivisionTask
     pos_t ref_point;         // Reference point with known WNV
     WNV ref_wnv;             // WNV at the reference point
     int depth = 0;
+
 };
 
 // Compute the center of gravity of a set of polygons
@@ -207,15 +209,19 @@ inline void compute_split(SubdivisionTask const& task, int& out_axis, pos_scalar
 }
 
 // Compute a new reference point for a child subproblem (Section 4.2.2)
-// When the old reference point is outside the new sub-AABB, we need to
-// trace a segment from the old reference to a new one inside the sub-AABB.
+//
+// Paper approach: project old_ref onto the child AABB boundary. This yields
+// a new position reachable by a SINGLE axis-aligned segment. Trace that one
+// segment to propagate the WNV. If the segment hits a polygon edge, try
+// small perturbations.
 inline bool compute_new_reference(
     pos_t const& old_ref,
     WNV const& old_wnv,
     IAABB const& new_bounds,
     std::vector<ConvexPolygon> const& polygons,
     pos_t& new_ref,
-    WNV& new_wnv)
+    WNV& new_wnv,
+    BVH const* = nullptr)
 {
     // If old reference is still inside the new bounds, keep it
     if (new_bounds.contains(old_ref))
@@ -225,44 +231,107 @@ inline bool compute_new_reference(
         return true;
     }
 
-    // Project old reference onto the new AABB boundary
-    // Find the closest point on the AABB boundary
-    pos_t projected = old_ref;
+    // Project old_ref onto the nearest face of the child AABB.
+    // Only ONE coordinate changes → single axis-aligned segment.
+    // Find which axis to project along (the one where old_ref is outside).
+    int proj_axis = -1;
     for (int a = 0; a < 3; a++)
     {
-        auto& coord = (&projected.x)[a];
-        auto bmin = (&new_bounds.min.x)[a];
-        auto bmax = (&new_bounds.max.x)[a];
-        if (coord < bmin) coord = bmin + pos_scalar_t(1);
-        else if (coord > bmax) coord = bmax - pos_scalar_t(1);
+        auto coord = (&old_ref.x)[a];
+        if (coord < (&new_bounds.min.x)[a] || coord > (&new_bounds.max.x)[a])
+        {
+            proj_axis = a;
+            break;
+        }
     }
 
-    // Now find an interior point of the AABB to use as reference
-    // Use the center of the AABB
+    if (proj_axis < 0)
+    {
+        // old_ref is inside bounds (shouldn't happen since we checked above)
+        new_ref = old_ref;
+        new_wnv = old_wnv;
+        return true;
+    }
+
+    // Try multiple target positions along the projection axis with small offsets
+    // to avoid landing on polygon edges.
+    for (int attempt = 0; attempt < 8; attempt++)
+    {
+        pos_t target = old_ref;
+
+        // Project along the identified axis, with a small offset for retries
+        auto coord = (&old_ref.x)[proj_axis];
+        auto bmin = (&new_bounds.min.x)[proj_axis];
+        auto bmax = (&new_bounds.max.x)[proj_axis];
+
+        if (coord < bmin)
+            (&target.x)[proj_axis] = bmin + pos_scalar_t(1 + attempt);
+        else
+            (&target.x)[proj_axis] = bmax - pos_scalar_t(1 + attempt);
+
+        // Clamp to bounds
+        if ((&target.x)[proj_axis] < bmin + pos_scalar_t(1))
+            (&target.x)[proj_axis] = bmin + pos_scalar_t(1);
+        if ((&target.x)[proj_axis] > bmax - pos_scalar_t(1))
+            (&target.x)[proj_axis] = bmax - pos_scalar_t(1);
+
+        // For retries, also perturb the other axes slightly
+        if (attempt >= 2)
+        {
+            for (int a = 0; a < 3; a++)
+            {
+                if (a == proj_axis) continue;
+                auto& c = (&target.x)[a];
+                auto lo = (&new_bounds.min.x)[a] + pos_scalar_t(1);
+                auto hi = (&new_bounds.max.x)[a] - pos_scalar_t(1);
+                c = c + pos_scalar_t(attempt - 1);
+                if (c > hi) c = hi;
+                if (c < lo) c = lo;
+            }
+        }
+
+        // Single-axis trace from old_ref to target
+        bool valid = true;
+        WNV traced = trace_axis_segment(old_ref, target, proj_axis,
+                                        old_wnv, polygons, valid);
+        if (valid)
+        {
+            // If we perturbed other axes, trace those too
+            if (attempt >= 2)
+            {
+                pos_t proj_point = old_ref;
+                (&proj_point.x)[proj_axis] = (&target.x)[proj_axis];
+                // Re-trace: first the projection axis, then the perturbed axes
+                traced = old_wnv;
+                pos_t cur = old_ref;
+                valid = true;
+                for (int a = 0; a < 3 && valid; a++)
+                {
+                    if ((&cur.x)[a] != (&target.x)[a])
+                    {
+                        pos_t next = cur;
+                        (&next.x)[a] = (&target.x)[a];
+                        traced = trace_axis_segment(cur, next, a, traced, polygons, valid);
+                        cur = next;
+                    }
+                }
+            }
+
+            if (valid)
+            {
+                new_ref = target;
+                new_wnv = traced;
+                return true;
+            }
+        }
+    }
+
+    // All attempts failed — fall back to 7-ray at AABB center
     pos_t center(new_bounds.midpoint(0), new_bounds.midpoint(1), new_bounds.midpoint(2));
-
-    // Trace L-path from old_ref to center to propagate WNV
-    // Use a "null" skip (no polygon to skip since this is reference propagation)
-    plane_t no_skip{};
-    WNV current_wnv = old_wnv;
-    pos_t cur = old_ref;
-    if (center.x != cur.x)
-    {
-        pos_t next(center.x, cur.y, cur.z);
-        current_wnv = trace_segment(cur, next, current_wnv, polygons, no_skip, -1);
-        cur = next;
-    }
-    if (center.y != cur.y)
-    {
-        pos_t next(cur.x, center.y, cur.z);
-        current_wnv = trace_segment(cur, next, current_wnv, polygons, no_skip, -1);
-        cur = next;
-    }
-    if (center.z != cur.z)
-        current_wnv = trace_segment(cur, center, current_wnv, polygons, no_skip, -1);
-
     new_ref = center;
-    new_wnv = current_wnv;
+    new_wnv = point_in_meshes_robust(
+        double(center.x), double(center.y), double(center.z),
+        polygons, static_cast<int>(old_wnv.size()));
     return true;
 }
 
@@ -276,6 +345,10 @@ inline void process_leaf(
     int n = static_cast<int>(polygons.size());
 
     if (n == 0) return;
+
+    // With exact segment tracing and reliable reference propagation,
+    // classification is LOCAL — we only need this leaf's polygons.
+    auto const& class_polys = polygons;
 
     // Optimization from Section 4.5.1: if all polygons have the same WNTV
     // and NSI flag is set, skip BSP construction
@@ -301,8 +374,9 @@ inline void process_leaf(
 
         if (all_nnc && n > 0)
         {
-            // All NNC: only need to classify one polygon, rest are the same
-            WNV w_front = task.ref_wnv;
+            WNV w_front = classify_leaf_polygon(
+                polygons[0].support, polygons[0].edges, task.ref_point, task.ref_wnv,
+                class_polys, task.bounds, polygons[0].delta_w, polygons[0].mesh_index);
             WNV w_back = propagate_wnv(w_front, 1, polygons[0].delta_w);
 
             int cls = classify_polygon_output(w_front, w_back, indicator);
@@ -321,15 +395,11 @@ inline void process_leaf(
         }
 
         // NSI but not NNC: classify each polygon individually
-        // Build BVH for classification raycast acceleration
-        BVH nsi_bvh;
-        nsi_bvh.build(polygons);
-
         for (auto const& poly : polygons)
         {
             WNV w_front = classify_leaf_polygon(
                 poly.support, poly.edges, task.ref_point, task.ref_wnv,
-                polygons, task.root_bounds, poly.delta_w, poly.mesh_index, &nsi_bvh);
+                class_polys, task.bounds, poly.delta_w, poly.mesh_index);
             WNV w_back = propagate_wnv(w_front, 1, poly.delta_w);
 
             int cls = classify_polygon_output(w_front, w_back, indicator);
@@ -397,10 +467,6 @@ inline void process_leaf(
         }
     }
 
-    // Build a combined BVH for accelerated raycast in WNV classification
-    BVH combined_bvh;
-    combined_bvh.build(polygons);
-
     for (int i = 0; i < n; i++)
     {
         auto const& poly_i = polygons[i];
@@ -410,7 +476,7 @@ inline void process_leaf(
             // No intersections: classify directly using the original polygon
             WNV w_front = classify_leaf_polygon(
                 poly_i.support, poly_i.edges, task.ref_point, task.ref_wnv,
-                polygons, task.root_bounds, poly_i.delta_w, poly_i.mesh_index, &combined_bvh);
+                class_polys, task.bounds, poly_i.delta_w, poly_i.mesh_index);
             WNV w_back = propagate_wnv(w_front, 1, poly_i.delta_w);
             int cls = classify_polygon_output(w_front, w_back, indicator);
 
@@ -426,11 +492,9 @@ inline void process_leaf(
     }
 
     // Pass 2: BSP-split intersecting polygons
-    int pass2_polys = 0, pass2_leaves = 0, pass2_emit = 0;
     for (int i = 0; i < n; i++)
     {
         if (all_isects[i].empty()) continue;
-        pass2_polys++;
 
         auto const& poly_i = polygons[i];
         LocalBSP bsp;
@@ -451,14 +515,12 @@ inline void process_leaf(
         {
             if (!leaf->enabled) continue;
             if (leaf->edges.size() < 3) continue;
-            pass2_leaves++;
 
             WNV w_front = classify_leaf_polygon(
                 poly_i.support, leaf->edges, task.ref_point, task.ref_wnv,
-                polygons, task.root_bounds, poly_i.delta_w, poly_i.mesh_index, &combined_bvh);
+                class_polys, task.bounds, poly_i.delta_w, poly_i.mesh_index);
             WNV w_back = propagate_wnv(w_front, 1, poly_i.delta_w);
             int cls = classify_polygon_output(w_front, w_back, indicator);
-            if (cls != 0) pass2_emit++;
 
             if (cls != 0)
             {
@@ -470,11 +532,11 @@ inline void process_leaf(
                 cp.polygon.delta_w = poly_i.delta_w;
                 cp.winding = {w_front, w_back};
                 cp.classification = cls;
+                cp.is_bsp_fragment = true;
                 output.push_back(std::move(cp));
             }
         }
     }
-    (void)pass2_polys; (void)pass2_leaves; (void)pass2_emit;
 }
 
 // Main recursive subdivision function
@@ -555,28 +617,27 @@ inline void subdivide(
             right_polys.push_back(poly);
             break;
         case ClipSide::Both:
-            // Send the FULL polygon (unclipped) to both cells.
-            // process_leaf will classify it correctly from each cell's reference.
-            // The two-pass architecture ensures non-intersecting polygons
-            // are only emitted once (from the cell where they're fully contained).
-            left_polys.push_back(poly);
-            right_polys.push_back(poly);
+            left_polys.push_back(std::move(cr.left));
+            right_polys.push_back(std::move(cr.right));
             break;
         }
     }
+
+    // Build BVH over current (pre-clip) polygons for reference propagation.
+    // Reference propagation needs the polygons BEFORE clipping since the
+    // trace path may cross the split plane.
+    BVH ref_bvh;
+    ref_bvh.build(task.polygons);
 
     // Compute reference points for each child
     pos_t left_ref, right_ref;
     WNV left_wnv, right_wnv;
 
     compute_new_reference(task.ref_point, task.ref_wnv, left_bounds,
-                          task.polygons, left_ref, left_wnv);
+                          task.polygons, left_ref, left_wnv, &ref_bvh);
     compute_new_reference(task.ref_point, task.ref_wnv, right_bounds,
-                          task.polygons, right_ref, right_wnv);
+                          task.polygons, right_ref, right_wnv, &ref_bvh);
 
-    // Recurse into children
-    // Process the smaller side first (continue with larger, add smaller to work queue)
-    // For sequential execution, just recurse both
     SubdivisionTask left_task;
     left_task.polygons = std::move(left_polys);
     left_task.bounds = left_bounds;

@@ -1,0 +1,3 @@
+[submodule "python/extern/nanobind"]
+	path = python/extern/nanobind
+	url = https://github.com/wjakob/nanobind.git
