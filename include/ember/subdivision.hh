@@ -244,11 +244,25 @@ inline bool compute_new_reference(
     // Use the center of the AABB
     pos_t center(new_bounds.midpoint(0), new_bounds.midpoint(1), new_bounds.midpoint(2));
 
-    // The reference WNV isn't needed when using raycast-from-probe classification.
-    // Just use ray from center to the top-level AABB boundary.
-    // For simplicity, we pass the old WNV through - classify_leaf_polygon
-    // doesn't use it (it uses raycast independently).
+    // Trace L-path from old_ref to center to propagate WNV
+    // Use a "null" skip (no polygon to skip since this is reference propagation)
+    plane_t no_skip{};
     WNV current_wnv = old_wnv;
+    pos_t cur = old_ref;
+    if (center.x != cur.x)
+    {
+        pos_t next(center.x, cur.y, cur.z);
+        current_wnv = trace_segment(cur, next, current_wnv, polygons, no_skip, -1);
+        cur = next;
+    }
+    if (center.y != cur.y)
+    {
+        pos_t next(cur.x, center.y, cur.z);
+        current_wnv = trace_segment(cur, next, current_wnv, polygons, no_skip, -1);
+        cur = next;
+    }
+    if (center.z != cur.z)
+        current_wnv = trace_segment(cur, center, current_wnv, polygons, no_skip, -1);
 
     new_ref = center;
     new_wnv = current_wnv;
@@ -310,11 +324,15 @@ inline void process_leaf(
         }
 
         // NSI but not NNC: classify each polygon individually
+        // Build BVH for classification raycast acceleration
+        BVH nsi_bvh;
+        nsi_bvh.build(polygons);
+
         for (auto const& poly : polygons)
         {
             WNV w_front = classify_leaf_polygon(
                 poly.support, poly.edges, task.ref_point, task.ref_wnv,
-                polygons, task.root_bounds, poly.delta_w);
+                polygons, task.root_bounds, poly.delta_w, poly.mesh_index, &nsi_bvh);
             WNV w_back = propagate_wnv(w_front, 1, poly.delta_w);
 
             int cls = classify_polygon_output(w_front, w_back, indicator);
@@ -395,7 +413,7 @@ inline void process_leaf(
             // No intersections: classify directly using the original polygon
             WNV w_front = classify_leaf_polygon(
                 poly_i.support, poly_i.edges, task.ref_point, task.ref_wnv,
-                polygons, task.root_bounds, poly_i.delta_w, &combined_bvh);
+                polygons, task.root_bounds, poly_i.delta_w, poly_i.mesh_index, &combined_bvh);
             WNV w_back = propagate_wnv(w_front, 1, poly_i.delta_w);
             int cls = classify_polygon_output(w_front, w_back, indicator);
 
@@ -411,9 +429,11 @@ inline void process_leaf(
     }
 
     // Pass 2: BSP-split intersecting polygons
+    int pass2_polys = 0, pass2_leaves = 0, pass2_emit = 0;
     for (int i = 0; i < n; i++)
     {
         if (all_isects[i].empty()) continue;
+        pass2_polys++;
 
         auto const& poly_i = polygons[i];
         LocalBSP bsp;
@@ -434,12 +454,14 @@ inline void process_leaf(
         {
             if (!leaf->enabled) continue;
             if (leaf->edges.size() < 3) continue;
+            pass2_leaves++;
 
             WNV w_front = classify_leaf_polygon(
                 poly_i.support, leaf->edges, task.ref_point, task.ref_wnv,
-                polygons, task.root_bounds, poly_i.delta_w, &combined_bvh);
+                polygons, task.root_bounds, poly_i.delta_w, poly_i.mesh_index, &combined_bvh);
             WNV w_back = propagate_wnv(w_front, 1, poly_i.delta_w);
             int cls = classify_polygon_output(w_front, w_back, indicator);
+            if (cls != 0) pass2_emit++;
 
             if (cls != 0)
             {
@@ -455,6 +477,9 @@ inline void process_leaf(
             }
         }
     }
+    if (pass2_polys > 0)
+        std::fprintf(stderr, "[process_leaf] pass2: %d polys, %d leaves, %d emit, %zu total output\n",
+            pass2_polys, pass2_leaves, pass2_emit, output.size());
 }
 
 // Main recursive subdivision function

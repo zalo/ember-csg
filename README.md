@@ -117,10 +117,10 @@ include/ember/
 ## References
 
 - Nehring-Wirxel, Nehring-Wirxel, Kobbelt. *"EMBER: Exact Mesh Booleans via Efficient and Robust Local Arrangements."* ACM Transactions on Graphics, 2024. [Project page](https://www.graphics.rwth-aachen.de/publication/03339/)
-- The `integer-plane-geometry` library from [mesh-kernel](https://github.com/jnehringwirxel/mesh-kernel)
+- The `integer-plane-geometry` library from [mesh-kernel](https://github.com/juliusnehring/mesh-kernel/)
 - [typed-geometry](https://github.com/project-arcana/typed-geometry) for fixed-width integer arithmetic
 - [manifold3d](https://github.com/elalish/manifold) for comparison and validation
 
 ## License
 
-This is an independent implementation for research and educational purposes. The EMBER algorithm is described in the referenced paper. The integer-plane-geometry foundation comes from mesh-kernel (see its license).
+MIT License. See [mesh-kernel](https://github.com/juliusnehring/mesh-kernel/) (also MIT) for the integer-plane-geometry foundation.

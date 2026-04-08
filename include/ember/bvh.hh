@@ -22,7 +22,9 @@ struct AABB
 
     void expand(double x, double y, double z)
     {
-        for (int a = 0; a < 3; a++) { min[a] = std::min(min[a], (&x)[a]); max[a] = std::max(max[a], (&x)[a]); }
+        min[0] = std::min(min[0], x); max[0] = std::max(max[0], x);
+        min[1] = std::min(min[1], y); max[1] = std::max(max[1], y);
+        min[2] = std::min(min[2], z); max[2] = std::max(max[2], z);
     }
     void expand(AABB const& o)
     {

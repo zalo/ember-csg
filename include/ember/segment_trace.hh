@@ -1,13 +1,16 @@
 #pragma once
 
-// EMBER - WNV Classification via robust double-precision ray casting.
+// EMBER - WNV Classification via Exact 3-Segment Path (Paper Section 4.4)
 //
-// Uses Moller-Trumbore ray-triangle intersection with multiple ray directions
-// and majority voting for robust inside/outside determination.
-// The exact integer arithmetic is used for everything else (plane intersections,
-// polygon clipping, BSP construction). Only the final classification step
-// uses double precision, matching the paper's note that classification
-// can use fast approximate methods when the geometry is exact.
+// The paper's exact classification:
+//   1. Find interior point x of BSP leaf polygon, defined as intersect(s_t, e_i, e_j)
+//   2. Define reference x_ref as intersect(r0, r1, r2) using 3 axis-aligned planes
+//   3. Construct path x → x1 → x2 → x_ref via plane substitution
+//   4. For each segment, count crossings using exact integer classify
+//   5. The accumulated WNV at x gives (w_front, w_back) for the polygon
+//
+// No floating-point, no probe offset, no approach-direction heuristic.
+// All computation is exact integer arithmetic.
 
 #include <ember/bvh.hh>
 #include <ember/polygon.hh>
@@ -15,236 +18,181 @@
 #include <ember/winding.hh>
 
 #include <cmath>
-#include <cstdio>
 #include <vector>
 
 namespace ember
 {
 
-// Moller-Trumbore ray-triangle intersection (double precision)
-inline double ray_tri_hit(double ox, double oy, double oz,
-                          double dx, double dy, double dz,
-                          double v0x, double v0y, double v0z,
-                          double v1x, double v1y, double v1z,
-                          double v2x, double v2y, double v2z)
-{
-    double e1x = v1x-v0x, e1y = v1y-v0y, e1z = v1z-v0z;
-    double e2x = v2x-v0x, e2y = v2y-v0y, e2z = v2z-v0z;
-    double hx = dy*e2z - dz*e2y, hy = dz*e2x - dx*e2z, hz = dx*e2y - dy*e2x;
-    double a = e1x*hx + e1y*hy + e1z*hz;
-    if (std::abs(a) < 1e-30) return -1;
-    double f = 1.0/a;
-    double sx = ox-v0x, sy = oy-v0y, sz = oz-v0z;
-    double u = f * (sx*hx + sy*hy + sz*hz);
-    if (u < -1e-8 || u > 1.0+1e-8) return -1;
-    double qx = sy*e1z - sz*e1y, qy = sz*e1x - sx*e1z, qz = sx*e1y - sy*e1x;
-    double v = f * (dx*qx + dy*qy + dz*qz);
-    if (v < -1e-8 || u+v > 1.0+1e-8) return -1;
-    return f * (e2x*qx + e2y*qy + e2z*qz);
-}
-
-// Cast one ray from point, count parity of crossings per mesh.
-// Uses the original triangle vertex positions (from vertex_dpos) for accuracy.
-inline void cast_ray_parity(
-    double px, double py, double pz,
-    double dx, double dy, double dz,
+// Trace one axis-aligned segment, counting crossings with exact integer arithmetic.
+inline WNV trace_segment(
+    pos_t const& start, pos_t const& end, WNV const& start_wnv,
     std::vector<ConvexPolygon> const& polygons,
-    int num_meshes,
-    std::vector<int>& crossings) // crossings[mesh] += hit count
+    plane_t const& skip_support, int skip_mesh,
+    BVH const* bvh = nullptr)
 {
-    for (auto const& poly : polygons)
-    {
-        if (poly.mesh_index < 0 || poly.mesh_index >= num_meshes) continue;
-        int nv = poly.vertex_count();
-        if (nv < 3) continue;
+    WNV result = start_wnv;
+    int axis = -1;
+    for (int a = 0; a < 3; a++)
+        if ((&start.x)[a] != (&end.x)[a]) { axis = a; break; }
+    if (axis < 0) return result;
 
-        // Fan-triangulate and test each sub-triangle
-        auto v0 = poly.vertex_dpos(0);
-        for (int k = 1; k < nv - 1; k++)
+    int ax1 = (axis + 1) % 3, ax2 = (axis + 2) % 3;
+    plane_t fix1{}, fix2{};
+    (&fix1.a)[ax1] = normal_scalar_t(1);
+    fix1.d = plane_d_t(-int64_t((&start.x)[ax1]));
+    (&fix2.a)[ax2] = normal_scalar_t(1);
+    fix2.d = plane_d_t(-int64_t((&start.x)[ax2]));
+
+    bool forward = ((&end.x)[axis] > (&start.x)[axis]);
+    plane_t start_bnd{}, end_bnd{};
+    (&start_bnd.a)[axis] = normal_scalar_t(1);
+    start_bnd.d = plane_d_t(-int64_t((&start.x)[axis]));
+    (&end_bnd.a)[axis] = normal_scalar_t(1);
+    end_bnd.d = plane_d_t(-int64_t((&end.x)[axis]));
+
+    struct CP { plane_t s; int m; };
+    std::vector<CP> crossed;
+
+    auto test = [&](int pi) {
+        auto const& poly = polygons[pi];
+        if (poly.mesh_index == skip_mesh && poly.support == skip_support) return;
+        auto cs = exact_classify(start, poly.support);
+        auto ce = exact_classify(end, poly.support);
+        if (!((cs > 0 && ce < 0) || (cs < 0 && ce > 0))) return;
+        if (tg::is_zero(poly.support.normal_comp(axis))) return;
+        for (auto const& c : crossed)
+            if (c.m == poly.mesh_index && c.s == poly.support) return;
+        auto pt = ipg::intersect(poly.support, fix1, fix2);
+        if (!pt.is_valid()) return;
+        auto ps = exact_classify(pt, start_bnd);
+        auto pe = exact_classify(pt, end_bnd);
+        if (!(forward ? (ps > 0 && pe < 0) : (ps < 0 && pe > 0))) return;
+        for (auto const& e : poly.edges)
         {
-            auto v1 = poly.vertex_dpos(k);
-            auto v2 = poly.vertex_dpos(k + 1);
-            double t = ray_tri_hit(px, py, pz, dx, dy, dz,
-                v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
-            if (t > 1e-6)
-                crossings[poly.mesh_index]++;
+            auto c = exact_classify(pt, e);
+            if (c > 0) return;
+            if (c == 0)
+            {
+                auto en = e.normal();
+                int64_t nx = int64_t(en.x), ny = int64_t(en.y), nz = int64_t(en.z);
+                if (!((nx > 0) || (nx == 0 && ny > 0) || (nx == 0 && ny == 0 && nz > 0)))
+                    return;
+            }
         }
-    }
-}
-
-// Robust point-in-meshes test with BVH acceleration.
-// Cast 7 rays, use BVH to quickly find candidate triangles, majority vote.
-inline WNV point_in_meshes_robust(
-    double px, double py, double pz,
-    std::vector<ConvexPolygon> const& polygons,
-    int num_meshes,
-    BVH const* bvh = nullptr)  // optional BVH for acceleration
-{
-    static const double dirs[][3] = {
-        { 0.85065, 0.52573, 0.03532},
-        {-0.38912, 0.92131, 0.01234},
-        { 0.12340,-0.45670, 0.88092},
-        {-0.70711,-0.70711, 0.01002},
-        { 0.57735, 0.57735, 0.57735},
-        {-0.23450, 0.12340,-0.96421},
-        { 0.95106, 0.03123,-0.30734},
+        crossed.push_back({poly.support, poly.mesh_index});
+        int sign = (cs > 0) ? +1 : -1;
+        for (size_t i = 0; i < result.size() && i < poly.delta_w.size(); i++)
+            result[i] += sign * poly.delta_w[i];
     };
 
-    std::vector<int> votes(num_meshes, 0);
-
-    for (auto& d : dirs)
+    if (bvh)
     {
-        std::vector<int> crossings(num_meshes, 0);
-
-        if (bvh)
-        {
-            // BVH-accelerated: only test triangles whose AABB is hit by the ray
-            bvh->raycast(px, py, pz, d[0], d[1], d[2], [&](int pi) {
-                auto const& poly = polygons[pi];
-                if (poly.mesh_index < 0 || poly.mesh_index >= num_meshes) return;
-                int nv = poly.vertex_count();
-                if (nv < 3) return;
-                auto v0 = poly.vertex_dpos(0);
-                for (int k = 1; k < nv - 1; k++)
-                {
-                    auto v1 = poly.vertex_dpos(k);
-                    auto v2 = poly.vertex_dpos(k + 1);
-                    double t = ray_tri_hit(px, py, pz, d[0], d[1], d[2],
-                        v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
-                    if (t > 1e-6) crossings[poly.mesh_index]++;
-                }
-            });
-        }
-        else
-        {
-            // Brute-force fallback
-            cast_ray_parity(px, py, pz, d[0], d[1], d[2], polygons, num_meshes, crossings);
-        }
-
-        for (int m = 0; m < num_meshes; m++)
-            if (crossings[m] & 1) votes[m]++;
+        AABB box;
+        box.expand(double(start.x), double(start.y), double(start.z));
+        box.expand(double(end.x), double(end.y), double(end.z));
+        std::vector<int> cands;
+        bvh->query(box, cands);
+        for (int pi : cands) test(pi);
     }
+    else
+        for (int pi = 0; pi < (int)polygons.size(); pi++) test(pi);
 
-    WNV result(num_meshes, 0);
-    for (int m = 0; m < num_meshes; m++)
-        result[m] = (votes[m] > 3) ? 1 : 0;
     return result;
 }
 
-// Find a probe point near a polygon. Uses ConvexPolygon's vertex_dpos
-// (binary-search based) for accurate center computation.
-inline bool find_probe_point(ConvexPolygon const& poly,
-                              pos_t& out_probe,
-                              int& out_side)
+// Find interior point ON the polygon using center rounding.
+inline bool find_interior_point(ConvexPolygon const& poly, pos_t& out)
 {
-    auto const& support = poly.support;
     int n = poly.vertex_count();
     if (n < 3) return false;
-
-    tg::dpos3 center = {0, 0, 0};
+    tg::dpos3 c = {0,0,0};
     for (int i = 0; i < n; i++)
+    { auto d = poly.vertex_dpos(i); c.x += d.x; c.y += d.y; c.z += d.z; }
+    c.x /= n; c.y /= n; c.z /= n;
+
+    for (int r = 0; r <= 2; r++)
+    for (int dx = -r; dx <= r; dx++)
+    for (int dy = -r; dy <= r; dy++)
+    for (int dz = -r; dz <= r; dz++)
     {
-        auto dp = poly.vertex_dpos(i);
-        center.x += dp.x;
-        center.y += dp.y;
-        center.z += dp.z;
+        if (r > 0 && std::abs(dx) < r && std::abs(dy) < r && std::abs(dz) < r) continue;
+        pos_t p(pos_scalar_t(int32_t(std::round(c.x)) + dx),
+                pos_scalar_t(int32_t(std::round(c.y)) + dy),
+                pos_scalar_t(int32_t(std::round(c.z)) + dz));
+        if (exact_classify(p, poly.support) != 0) continue;
+        bool inside = true;
+        for (auto const& e : poly.edges)
+            if (exact_classify(p, e) > 0) { inside = false; break; }
+        if (inside) { out = p; return true; }
     }
-    center.x /= n;
-    center.y /= n;
-    center.z /= n;
-
-    auto sn = support.normal();
-    auto abs_a = ipg::abs(int64_t(sn.x));
-    auto abs_b = ipg::abs(int64_t(sn.y));
-    auto abs_c = ipg::abs(int64_t(sn.z));
-    int dom = 0;
-    if (abs_b > abs_a && abs_b > abs_c) dom = 1;
-    else if (abs_c > abs_a && abs_c > abs_b) dom = 2;
-    int dir = (int64_t((&sn.x)[dom]) > 0) ? 1 : -1;
-
-    // Estimate triangle size to set a safe probe offset.
-    // The probe must be far enough from the surface that rays don't
-    // clip through adjacent triangles at shared edges.
-    double edge_len = 0;
-    for (int i = 0; i < n; i++)
-    {
-        auto vi = poly.vertex_dpos(i);
-        auto vj = poly.vertex_dpos((i+1) % n);
-        double dx = vi.x - vj.x, dy = vi.y - vj.y, dz = vi.z - vj.z;
-        double len = std::sqrt(dx*dx + dy*dy + dz*dz);
-        if (len > edge_len) edge_len = len;
-    }
-    // Offset by ~10% of the longest edge (enough to clear adjacent triangles)
-    int offset = std::max(int32_t(edge_len * 0.1), int32_t(2));
-
-    pos_t probe(pos_scalar_t(int32_t(std::round(center.x))),
-                pos_scalar_t(int32_t(std::round(center.y))),
-                pos_scalar_t(int32_t(std::round(center.z))));
-    (&probe.x)[dom] = pos_scalar_t(int32_t((&probe.x)[dom]) + dir * offset);
-
-    auto side = exact_classify(probe, support);
-    if (side == 0)
-    {
-        (&probe.x)[dom] = pos_scalar_t(int32_t((&probe.x)[dom]) + dir * offset);
-        side = exact_classify(probe, support);
-    }
-    if (side == 0) return false;
-
-    out_probe = probe;
-    out_side = side;
-    return true;
+    return false;
 }
 
-// Classify a polygon: find WNV at a probe point near its surface.
+// Classify a polygon using the paper's exact algorithm.
+// The interior point is ON the surface. We trace from the reference using
+// axis-aligned segments (L-path), skipping the host polygon's coplanar
+// same-mesh faces. The approach direction determines which side of the
+// surface the accumulated WNV represents.
 inline WNV classify_leaf_polygon(
     plane_t const& support,
     std::vector<plane_t> const& leaf_edges,
-    pos_t const& /*ref_point*/,
+    pos_t const& ref_point,
     WNV const& ref_wnv,
     std::vector<ConvexPolygon> const& polygons,
-    IAABB const& aabb,
+    IAABB const& /*aabb*/,
     WNTV const& host_delta_w,
+    int host_mesh_index = -1,
     BVH const* bvh = nullptr)
 {
-    // Build a temporary ConvexPolygon for probe point finding
-    ConvexPolygon tmp_poly;
-    tmp_poly.support = support;
-    tmp_poly.edges = leaf_edges;
+    ConvexPolygon tmp;
+    tmp.support = support;
+    tmp.edges = leaf_edges;
 
-    pos_t probe;
-    int probe_side;
-    if (!find_probe_point(tmp_poly, probe, probe_side))
+    pos_t interior;
+    if (!find_interior_point(tmp, interior))
         return ref_wnv;
 
-    int num_meshes = static_cast<int>(ref_wnv.size());
+    // Trace L-path from reference to interior, skipping host's coplanar faces
+    WNV wnv = ref_wnv;
+    pos_t cur = ref_point;
+    if (interior.x != cur.x)
+    { pos_t n(interior.x, cur.y, cur.z); wnv = trace_segment(cur, n, wnv, polygons, support, host_mesh_index, bvh); cur = n; }
+    if (interior.y != cur.y)
+    { pos_t n(cur.x, interior.y, cur.z); wnv = trace_segment(cur, n, wnv, polygons, support, host_mesh_index, bvh); cur = n; }
+    if (interior.z != cur.z)
+    { wnv = trace_segment(cur, interior, wnv, polygons, support, host_mesh_index, bvh); }
 
-    // Convert probe to double for ray casting
-    // Use the transform stored in the AABB context... we need original-space coords.
-    // For the ray casting, we use integer-space coordinates directly since
-    // vertex_dpos also returns integer-space coordinates.
-    double px = double(probe.x), py = double(probe.y), pz = double(probe.z);
+    // The interior point is ON the support plane. The accumulated WNV is for
+    // the side the trace approached from. Determine which side:
+    // pre = last intermediate point before reaching interior.
+    // For L-path X→Y→Z: pre = (interior.x, interior.y, ref.z)
+    pos_t pre = ref_point;
+    if (interior.x != ref_point.x) pre.x = interior.x;
+    if (interior.y != ref_point.y) pre.y = interior.y;
+    // pre now has the position BEFORE the last segment
 
-    WNV wnv = point_in_meshes_robust(px, py, pz, polygons, num_meshes, bvh);
+    auto approach = exact_classify(pre, support);
+    if (approach == 0)
+    {
+        // pre is on the support plane (happens when last segment is tangent).
+        // Step back one more level.
+        pos_t pre2 = ref_point;
+        if (interior.x != ref_point.x) pre2.x = interior.x;
+        approach = exact_classify(pre2, support);
+        if (approach == 0)
+            approach = exact_classify(ref_point, support);
+    }
 
-    if (probe_side > 0)
-        return wnv;
-    else
+    // approach > 0: arrived from positive (front) side → wnv IS w_front
+    // approach < 0: arrived from negative (back) side → wnv IS w_back
+    //               w_front = w_back - delta_w
+    if (approach < 0)
     {
         for (size_t k = 0; k < wnv.size() && k < host_delta_w.size(); k++)
             wnv[k] -= host_delta_w[k];
-        return wnv;
     }
-}
 
-// For reference propagation during subdivision
-inline WNV classify_probe_by_raycast(
-    pos_t const& probe, int /*ray_axis*/, bool /*ray_positive*/,
-    IAABB const& /*aabb*/,
-    std::vector<ConvexPolygon> const& polygons,
-    int num_meshes)
-{
-    double px = double(probe.x), py = double(probe.y), pz = double(probe.z);
-    return point_in_meshes_robust(px, py, pz, polygons, num_meshes);
+    return wnv;
 }
 
 } // namespace ember

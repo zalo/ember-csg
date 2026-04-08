@@ -44,14 +44,13 @@ target_link_libraries(ember-test PRIVATE ember-csg)
 add_executable(ember-roundtrip test/test_roundtrip.cc)
 target_link_libraries(ember-roundtrip PRIVATE ember-csg)
 
-add_executable(ember-wnv test/test_wnv.cc)
-target_link_libraries(ember-wnv PRIVATE ember-csg)
 
-add_executable(ember-trace test/test_trace.cc)
-target_link_libraries(ember-trace PRIVATE ember-csg)
 
 add_executable(ember-perf test/test_perf.cc)
 target_link_libraries(ember-perf PRIVATE ember-csg)
 
 add_executable(ember-manifold test/test_manifold.cc)
 target_link_libraries(ember-manifold PRIVATE ember-csg)
+
+add_executable(ember-bvh-validate test/test_bvh_validate.cc)
+target_link_libraries(ember-bvh-validate PRIVATE ember-csg)
